@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distributed-kv-store"
+version = "0.1.0"
+description = "Single-node LSM key/value store with write-ahead log and snapshots (stdlib only)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+distributed-kv-store = "kvstore.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kvstore*"]
