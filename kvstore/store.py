@@ -6,17 +6,24 @@ answer (the key is deleted); only a full miss means the key never existed.
 Write path: WAL first (so a crash cannot lose an acknowledged write), then the memtable. `flush`
 seals the memtable into a new table and resets the log; `compact` merges every table into one and
 drops tombstones that no longer hide anything.
+
+Scans and compaction merge the layers incrementally: each sealed table is an ordered iterator
+over lazily-read blocks and the memtable is one ordered iterator, combined with a small heap. No
+layer is ever copied into a covering dictionary, so neither path grows resident memory with the
+sealed value payload.
 """
 
 from __future__ import annotations
 
+import heapq
 import os
 import re
 from dataclasses import dataclass, field
+from typing import Iterator
 
 from .errors import ValidationError
 from .memtable import MemTable
-from .sstable import SSTable
+from .sstable import SSTable, SSTableWriter
 from .wal import DEL, PUT, WriteAheadLog, replay
 
 TABLE_PATTERN = re.compile(r"^table-(\d+)\.sst$")
@@ -133,8 +140,8 @@ class Store:
             return None
         items = self.memtable.items()
         path = self._table_path(self.next_table_number)
-        SSTable.write(path, items)
-        self.tables.insert(0, SSTable.open(path))
+        table = SSTable.write(path, items)
+        self.tables.insert(0, table)
         self.memtable.clear()
         self.wal.reset()
         self.wal_records = 0
@@ -143,28 +150,45 @@ class Store:
     def compact(self) -> dict[str, object]:
         """Merge every table plus the memtable into one, dropping unreachable tombstones.
 
-        Order matters: oldest table first, newest last, memtable last of all -- each layer simply
-        overwrites the previous one, so the surviving value is the newest. (Writing this the other way
-        round kept the *oldest* value, which the compaction test caught.)
+        Layers are streamed oldest -> newest -> memtable through the same incremental merge the
+        read path uses, so the newest value wins and tombstones hide older ones without anyone
+        buffering a copy of the database. The new table is fully written and sealed (its crc32
+        checked by `SSTable.open`) before the old tables are removed: a failure mid-merge leaves
+        the sealed inputs untouched on disk.
         """
-        merged: dict[str, str | None] = {}
-        for table in reversed(self.tables):  # oldest first
-            for key, value in table.items():
-                merged[key] = value
-        for key, value in self.memtable.items():  # newest wins
-            merged[key] = value
-        live = [(key, value) for key, value in sorted(merged.items()) if value is not None]
         removed = [table.path for table in self.tables]
         path = self._table_path(self.next_table_number)
-        SSTable.write(path, live)
+        estimate = sum(table.count for table in self.tables) + len(self.memtable.entries)
+        temporary = path + ".tmp"
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+        writer = SSTableWriter(temporary, estimate)
+        live = 0
+        try:
+            for key, value in self._visible_entries():
+                if value is None:
+                    continue
+                writer.add(key, value)
+                live += 1
+            writer.close(live)  # validates the seal before anything old is touched
+        except BaseException:
+            writer.abort()
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+        # Publish first, delete after: a crash in between leaves the new higher-numbered table
+        # next to the old ones, and layer ordering lets it win on reopen -- no lost writes.
+        os.replace(temporary, path)
         for old in removed:
             if os.path.exists(old):
                 os.unlink(old)
-        self.tables = [SSTable.open(path)]
+        # Re-open from its final name so the resident index carries the path callers see.
+        table = SSTable.open(path)
+        self.tables = [table]
         self.memtable.clear()
         self.wal.reset()
         self.wal_records = 0
-        return {"table": path, "keys": len(live), "removedTables": len(removed)}
+        return {"table": path, "keys": live, "removedTables": len(removed)}
 
     # -- reads ---------------------------------------------------------------
     def get(self, key: str) -> tuple[bool, str | None]:
@@ -182,21 +206,10 @@ class Store:
             raise ValidationError("limit must be > 0", value=limit)
         if start and end and end < start:
             raise ValidationError("end must be >= start", value=f"{start}..{end}")
-        merged: dict[str, str | None] = {}
-        for table in reversed(self.tables):
-            for key, value in table.items():
-                merged[key] = value
-        for key, value in self.memtable.items():
-            merged[key] = value
         rows: list[tuple[str, str]] = []
-        for key in sorted(merged):
-            value = merged[key]
-            if value is None:
-                continue
-            if start is not None and key < start:
-                continue
-            if end is not None and key >= end:
-                continue
+        for key, value in self._visible_entries(start=start, end=end):
+            # Only visible (non-tombstone) rows come out of the merge, so each emitted row counts
+            # toward the limit; reaching it closes the layer iterators and stops further reads.
             rows.append((key, value))
             if limit is not None and len(rows) >= limit:
                 break
@@ -216,7 +229,7 @@ class Store:
         return StoreStats(
             directory=os.path.abspath(self.directory),
             tables=len(self.tables),
-            sealed_entries=sum(len(table.values) for table in self.tables),
+            sealed_entries=sum(table.count for table in self.tables),
             memtable_entries=len(self.memtable.entries),
             memtable_bytes=self.memtable.bytes_used,
             tombstones=tombstones,
@@ -246,6 +259,68 @@ class Store:
         }
 
     # -- internals -----------------------------------------------------------
+    def _layer_iterators(self, start: str | None, end: str | None) -> list[Iterator[tuple[str, str | None]]]:
+        """Ordered iterators from newest layer to oldest.
+
+        The memtable is fully resident already; each sealed table contributes a lazy iterator
+        that only reads the blocks its range touches. Nothing here copies a table.
+        """
+        layers: list[Iterator[tuple[str, str | None]]] = [iter(self.memtable.items())]
+        for table in self.tables:
+            layers.append(table.scan(start=start, end=end))
+        return layers
+
+    def _visible_entries(
+        self,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """K-way merge of every layer, newest wins, yielding only visible (non-tombstone) rows.
+
+        Heap entries are `(key, layer)`; equal keys collapse onto the newest layer (layer 0) and
+        stale copies in older layers are consumed and discarded. Rows hidden by a tombstone are
+        skipped but still pull every layer past that key, so iteration stays incremental.
+        """
+        layers = self._layer_iterators(start, end)
+
+        heap: list[tuple[str, int]] = []
+        current: list[tuple[str, str | None] | None] = [None] * len(layers)
+
+        def advance(layer: int) -> None:
+            try:
+                key, value = next(layers[layer])
+            except StopIteration:
+                current[layer] = None
+                return
+            current[layer] = (key, value)
+            heapq.heappush(heap, (key, layer))
+
+        try:
+            for layer in range(len(layers)):
+                advance(layer)
+
+            while heap:
+                key, layer = heapq.heappop(heap)
+                winner = current[layer]
+                advance(layer)
+                # Drain every older copy of this key: the newest layer already decided the outcome.
+                while heap and heap[0][0] == key:
+                    _, stale_layer = heapq.heappop(heap)
+                    advance(stale_layer)
+                if end is not None and key >= end:
+                    return
+                if start is not None and key < start:
+                    continue
+                if winner is not None and winner[1] is not None:
+                    yield key, winner[1]
+        finally:
+            # An early `limit` break must release each table scan's file handle promptly rather
+            # than waiting for garbage collection.
+            for layer in layers:
+                close = getattr(layer, "close", None)
+                if close is not None:
+                    close()
+
     def _table_paths(self) -> list[str]:
         if not os.path.isdir(self.directory):
             return []
