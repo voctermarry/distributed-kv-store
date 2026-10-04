@@ -10,16 +10,97 @@ drops tombstones that no longer hide anything.
 
 from __future__ import annotations
 
+import heapq
 import os
 import re
+from bisect import bisect_left
 from dataclasses import dataclass, field
+from typing import Iterator
 
 from .errors import ValidationError
 from .memtable import MemTable
-from .sstable import SSTable
+from .sstable import EMPTY_MARKER, TOMBSTONE_BYTE, SSTable, TableWriter
 from .wal import DEL, PUT, WriteAheadLog, replay
 
 TABLE_PATTERN = re.compile(r"^table-(\d+)\.sst$")
+
+
+class _Cursor:
+    """One ordered layer in the k-way merge. Lower rank wins a key tie (newer layer wins).
+
+    The head is ``(key, marker_or_value)``: table cursors carry only the value-marker byte and
+    fetch the value on demand, while the memtable cursor carries the value directly.
+    """
+
+    __slots__ = ("rank", "key", "payload")
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+        self.key: str | None = None
+        self.payload: object = None
+
+    def __lt__(self, other: "_Cursor") -> bool:
+        return (self.key, self.rank) < (other.key, other.rank)
+
+
+class _MemTableCursor(_Cursor):
+    __slots__ = ("entries", "positions", "index")
+
+    def __init__(self, entries: dict[str, str | None], start: str | None) -> None:
+        super().__init__(rank=0)  # the memtable is the newest layer
+        self.entries = entries
+        self.positions = sorted(entries)
+        self.index = bisect_left(self.positions, start) if start is not None else 0
+        self._load()
+
+    def _load(self) -> None:
+        if self.index < len(self.positions):
+            self.key = self.positions[self.index]
+            self.payload = self.entries[self.key]
+        else:
+            self.key = None
+
+    @property
+    def tombstone(self) -> bool:
+        return self.payload is None
+
+    def advance(self) -> None:
+        self.index += 1
+        self._load()
+
+    def read_value(self) -> str:
+        return self.payload  # type: ignore[return-value]
+
+
+class _TableCursor(_Cursor):
+    __slots__ = ("stream")
+
+    def __init__(self, table: SSTable, rank: int, start: str | None) -> None:
+        super().__init__(rank=rank)
+        self.stream = table.open_stream(start)
+        if self.stream.head is None:
+            self.key = None
+        else:
+            self.key, self.payload = self.stream.head
+
+    def advance(self) -> None:
+        self.stream.advance()
+        if self.stream.head is None:
+            self.key = None
+        else:
+            self.key, self.payload = self.stream.head
+
+    @property
+    def tombstone(self) -> bool:
+        return self.payload == TOMBSTONE_BYTE
+
+    def read_value(self) -> str:
+        if self.payload == EMPTY_MARKER:  # empty-string value: no value bytes to fetch
+            return ""
+        return self.stream.value()
+
+    def close(self) -> None:
+        self.stream.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,8 +214,8 @@ class Store:
             return None
         items = self.memtable.items()
         path = self._table_path(self.next_table_number)
-        SSTable.write(path, items)
-        self.tables.insert(0, SSTable.open(path))
+        table = SSTable.write(path, items)
+        self.tables.insert(0, table)
         self.memtable.clear()
         self.wal.reset()
         self.wal_records = 0
@@ -143,28 +224,34 @@ class Store:
     def compact(self) -> dict[str, object]:
         """Merge every table plus the memtable into one, dropping unreachable tombstones.
 
-        Order matters: oldest table first, newest last, memtable last of all -- each layer simply
-        overwrites the previous one, so the surviving value is the newest. (Writing this the other way
-        round kept the *oldest* value, which the compaction test caught.)
+        Order matters: oldest table first, newest last, memtable last of all -- the incremental
+        merge lets each newer layer overwrite the key's previous owner, so the surviving value is
+        the newest, and the surviving rows stream straight into the new table: no full copy of the
+        sealed payload is ever built. (Writing this the other way round kept the *oldest* value,
+        which the compaction test caught.)
         """
-        merged: dict[str, str | None] = {}
-        for table in reversed(self.tables):  # oldest first
-            for key, value in table.items():
-                merged[key] = value
-        for key, value in self.memtable.items():  # newest wins
-            merged[key] = value
-        live = [(key, value) for key, value in sorted(merged.items()) if value is not None]
         removed = [table.path for table in self.tables]
         path = self._table_path(self.next_table_number)
-        SSTable.write(path, live)
+        writer = TableWriter(path)
+        keys = 0
+        try:
+            for key, value in self._merged_rows():
+                if value is None:
+                    continue  # nothing older remains below this table: the tombstone is unreachable
+                writer.add(key, value)
+                keys += 1
+            new_table = writer.finish()
+        except BaseException:
+            writer.abort()
+            raise
         for old in removed:
             if os.path.exists(old):
                 os.unlink(old)
-        self.tables = [SSTable.open(path)]
+        self.tables = [new_table]
         self.memtable.clear()
         self.wal.reset()
         self.wal_records = 0
-        return {"table": path, "keys": len(live), "removedTables": len(removed)}
+        return {"table": path, "keys": keys, "removedTables": len(removed)}
 
     # -- reads ---------------------------------------------------------------
     def get(self, key: str) -> tuple[bool, str | None]:
@@ -182,28 +269,59 @@ class Store:
             raise ValidationError("limit must be > 0", value=limit)
         if start and end and end < start:
             raise ValidationError("end must be >= start", value=f"{start}..{end}")
-        merged: dict[str, str | None] = {}
-        for table in reversed(self.tables):
-            for key, value in table.items():
-                merged[key] = value
-        for key, value in self.memtable.items():
-            merged[key] = value
         rows: list[tuple[str, str]] = []
-        for key in sorted(merged):
-            value = merged[key]
-            if value is None:
-                continue
-            if start is not None and key < start:
-                continue
-            if end is not None and key >= end:
-                continue
-            rows.append((key, value))
-            if limit is not None and len(rows) >= limit:
-                break
+        merged = self._merged_rows(start=start, end=end)
+        try:
+            for key, value in merged:
+                if value is None:
+                    continue  # tombstone hides whatever an older layer still holds for this key
+                rows.append((key, value))
+                if limit is not None and len(rows) >= limit:
+                    break  # close() below stops every cursor; no later entry is touched
+        finally:
+            merged.close()  # releases the tables' read handles deterministically
         return rows
 
     def snapshot(self) -> Snapshot:
         return Snapshot(sequence=self.writes, visible=tuple(self.scan()))
+
+    def _merged_rows(self, start: str | None = None, end: str | None = None) -> Iterator[tuple[str, str | None]]:
+        """Incrementally merge the memtable and every sealed table in global key order.
+
+        Layers are never copied: each layer contributes one forward cursor (a probe-only disk
+        cursor for tables), and a heap hands back one distinct key at a time together with the
+        value of its *newest* owner -- a tombstone marker surfaces as ``None``. Older copies of the
+        same key are drained (and their value bytes never read) before the row is yielded.
+        """
+        cursors: list[_Cursor] = []
+        try:
+            memtable_cursor = _MemTableCursor(self.memtable.entries, start)
+            if memtable_cursor.key is not None:
+                cursors.append(memtable_cursor)
+            for rank, table in enumerate(self.tables, start=1):  # tables are ordered newest first
+                cursor = _TableCursor(table, rank, start)
+                if cursor.key is None:
+                    cursor.close()
+                    continue
+                cursors.append(cursor)
+            heap = [(cursor.key, cursor.rank, cursor) for cursor in cursors]
+            heapq.heapify(heap)
+            while heap:
+                key, _, winner = heap[0]
+                if end is not None and key >= end:
+                    return
+                value = None if winner.tombstone else winner.read_value()
+                while heap and heap[0][0] == key:  # retire every older copy of this key
+                    _, _, cursor = heapq.heappop(heap)
+                    cursor.advance()
+                    if cursor.key is not None:
+                        heapq.heappush(heap, (cursor.key, cursor.rank, cursor))
+                yield key, value
+        finally:
+            for cursor in cursors:
+                close = getattr(cursor, "close", None)
+                if close is not None:
+                    close()
 
     # -- reporting -----------------------------------------------------------
     @property
@@ -216,7 +334,7 @@ class Store:
         return StoreStats(
             directory=os.path.abspath(self.directory),
             tables=len(self.tables),
-            sealed_entries=sum(len(table.values) for table in self.tables),
+            sealed_entries=sum(table.count for table in self.tables),
             memtable_entries=len(self.memtable.entries),
             memtable_bytes=self.memtable.bytes_used,
             tombstones=tombstones,
