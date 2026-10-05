@@ -18,7 +18,7 @@ import zlib
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
-from .errors import ParseError, ValidationError
+from .errors import OutputError, ParseError, ValidationError
 
 PUT = "put"
 DEL = "del"
@@ -123,10 +123,16 @@ class WriteAheadLog:
         payload: dict[str, object] = {"op": op, "key": key, "seq": self._sequence}
         if op == PUT:
             payload["value"] = value
-        self._handle.write(encode_record(payload))
-        self._handle.flush()
-        if self.sync:
-            os.fsync(self._handle.fileno())
+        try:
+            self._handle.write(encode_record(payload))
+            self._handle.flush()
+            if self.sync:
+                os.fsync(self._handle.fileno())
+        except OSError as error:
+            # The record may sit in an unflushed buffer but it is not durable, so it must never be
+            # counted as a recoverable WAL record; the next open's torn-tail truncation is the
+            # authority on what survived. Normalise the filesystem failure like every other sink.
+            raise OutputError("the write-ahead log could not be appended", path=self.path) from error
         return self._sequence
 
     def reset(self) -> None:

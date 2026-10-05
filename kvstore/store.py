@@ -205,6 +205,9 @@ class Store:
     def put(self, key: str, value: str) -> None:
         self._check_key(key)
         self.wal.append(PUT, key, value)
+        # The record is durable now; count it before sealing, so a failed automatic flush still
+        # leaves the counter equal to the recoverable records the WAL holds.
+        self.wal_records += 1
         self.memtable.put(key, value)
         self.writes += 1
         if self.memtable.is_full():
@@ -213,6 +216,9 @@ class Store:
     def delete(self, key: str) -> None:
         self._check_key(key)
         self.wal.append(DEL, key)
+        # Every delete appends one recoverable record, even for a missing or already-deleted key;
+        # the counter tracks records, not distinct keys.
+        self.wal_records += 1
         self.memtable.delete(key)
         self.writes += 1
         if self.memtable.is_full():
@@ -224,7 +230,13 @@ class Store:
             return None
         items = self.memtable.items()
         path = self._table_path(self.next_table_number)
-        table = SSTable.write(path, items)
+        try:
+            table = SSTable.write(path, items)
+        except OSError as error:
+            # Nothing was sealed: the memtable and the WAL are untouched, so every record the log
+            # holds -- including the write whose automatic flush this was -- stays recoverable and
+            # stays counted. SSTable.write already removed its own temp files.
+            raise OutputError("the memtable could not be sealed", path=path) from error
         self.tables.insert(0, table)
         self.memtable.clear()
         self.wal.reset()
