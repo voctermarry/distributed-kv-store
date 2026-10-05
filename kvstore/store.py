@@ -11,18 +11,21 @@ drops tombstones that no longer hide anything.
 from __future__ import annotations
 
 import heapq
+import json
 import os
 import re
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from typing import Iterator
 
-from .errors import ValidationError
+from .errors import CorruptionError, OutputError, ValidationError
 from .memtable import MemTable
-from .sstable import EMPTY_MARKER, TOMBSTONE_BYTE, SSTable, TableWriter
-from .wal import DEL, PUT, WriteAheadLog, replay
+from .sstable import _TMP_ENTRY, _TMP_FINAL, EMPTY_MARKER, TOMBSTONE_BYTE, SSTable, TableWriter
+from .wal import DEL, PUT, WriteAheadLog, durable_replace, fsync_directory, replay
 
 TABLE_PATTERN = re.compile(r"^table-(\d+)\.sst$")
+MANIFEST_NAME = ".compact.json"
+MANIFEST_TMP_NAME = ".compact.json.tmp"
 
 
 class _Cursor:
@@ -169,6 +172,7 @@ class Store:
     # -- lifecycle -----------------------------------------------------------
     def open(self) -> "Store":
         os.makedirs(self.directory, exist_ok=True)
+        self._recover_compaction()
         self.tables = [SSTable.open(path) for path in self._table_paths()]
         self.tables.reverse()  # newest first
         self.wal.open()
@@ -229,27 +233,60 @@ class Store:
         the newest, and the surviving rows stream straight into the new table: no full copy of the
         sealed payload is ever built. (Writing this the other way round kept the *oldest* value,
         which the compaction test caught.)
+
+        Crash safety: the switch is driven by a durable manifest written before the new table is
+        created. The result is only reported once the new layout -- one sealed table, the old
+        tables gone, the WAL describing nothing it does not already contain -- is committed and
+        the manifest itself removed. Any earlier kill is repaired deterministically on the next
+        open (roll back while the manifest is still ``writing``; roll forward once committed).
         """
         removed = [table.path for table in self.tables]
         path = self._table_path(self.next_table_number)
-        writer = TableWriter(path)
+        result_name = os.path.basename(path)
+        source_names = [os.path.basename(old) for old in removed]
+        self._write_manifest({"phase": "writing", "result": result_name, "sources": source_names})
         keys = 0
+        writer: TableWriter | None = None
         try:
+            writer = TableWriter(path)
             for key, value in self._merged_rows():
                 if value is None:
                     continue  # nothing older remains below this table: the tombstone is unreachable
                 writer.add(key, value)
                 keys += 1
             new_table = writer.finish()
-        except BaseException:
-            writer.abort()
+        except BaseException as error:
+            if writer is not None:
+                try:
+                    writer.abort()
+                except OSError:
+                    pass
+            # The commit point has not been reached: undo the durable intent so the directory
+            # reads exactly as it did before this call, then surface the failure.
+            self._rollback_intent(path)
+            if isinstance(error, OSError):
+                raise OutputError("could not write the compacted table", path=path) from error
             raise
-        for old in removed:
-            if os.path.exists(old):
-                os.unlink(old)
+        # The new table is sealed (its file and directory entry are both fsynced by finish()).
+        # From here on the manifest says "committed": an interruption is rolled forward on the
+        # next open, so the acknowledged logical state cannot be lost either way.
+        self._write_manifest({"phase": "committed", "result": result_name, "sources": source_names})
+        try:
+            for old in removed:
+                if os.path.exists(old):
+                    os.unlink(old)
+            fsync_directory(self.directory)
+            # The old tables are durably gone: truncating the WAL can now only reveal the same
+            # state the new table already holds.
+            self.wal.reset()
+            self._unlink_quiet(self._manifest_tmp_path())
+            self._unlink_quiet(self._manifest_path())
+            fsync_directory(self.directory)
+        except OSError as error:
+            raise OutputError("could not finish persisting the compaction", path=self.directory) from error
+        # Durable commit complete -- only now publish the new layout in memory.
         self.tables = [new_table]
         self.memtable.clear()
-        self.wal.reset()
         self.wal_records = 0
         return {"table": path, "keys": keys, "removedTables": len(removed)}
 
@@ -345,6 +382,7 @@ class Store:
 
     def verify(self) -> dict[str, object]:
         """Re-open every artifact from disk and report what recovery had to repair."""
+        self._recover_compaction()
         tables = []
         for path in self._table_paths():
             table = SSTable.open(path)  # raises CorruptionError when the seal is broken
@@ -362,6 +400,136 @@ class Store:
                 "deletedKeys": sum(1 for value in state.values() if value is None),
             },
         }
+
+    # -- compaction crash recovery -------------------------------------------
+    def _manifest_path(self) -> str:
+        return os.path.join(self.directory, MANIFEST_NAME)
+
+    def _manifest_tmp_path(self) -> str:
+        return os.path.join(self.directory, MANIFEST_TMP_NAME)
+
+    def _manifest_path_to(self, name: str) -> str:
+        return os.path.join(self.directory, name)
+
+    @staticmethod
+    def _is_table_name(name: str) -> bool:
+        return bool(TABLE_PATTERN.match(name))
+
+    def _write_manifest(self, document: dict[str, object]) -> None:
+        """Durably publish the compaction intent via temp file + atomic rename + dir fsync."""
+        manifest = self._manifest_path()
+        tmp = self._manifest_tmp_path()
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, manifest)
+            fsync_directory(self.directory)
+        except OSError as error:
+            self._unlink_quiet(tmp)
+            raise OutputError("could not persist the compaction intent", path=manifest) from error
+
+    def _recover_compaction(self) -> None:
+        """Deterministically finish or undo a compaction interrupted by a killed process.
+
+        ``writing`` means the commit point (the new sealed table plus the committed intent) was
+        not reached: the partial output is discarded and every source table stays authoritative.
+        ``committed`` means the new table was sealed, verified and published: leftover source
+        tables are removed and the WAL -- whose records all landed in the new table -- is
+        truncated. Both layouts resolve to the same logical data, and repeating this routine
+        changes nothing.
+        """
+        manifest_path = self._manifest_path()
+        self._remove_writer_spools(None)
+        self._remove_wal_spools()
+        self._unlink_quiet(self._manifest_tmp_path())
+        if not os.path.exists(manifest_path):
+            return
+        phase = "writing"
+        result: str | None = None
+        sources: list[str] = []
+        try:
+            with open(manifest_path, "rb") as handle:
+                document = json.loads(handle.read().decode("utf-8"))
+            phase = str(document["phase"])
+            result_name = str(document["result"])
+            source_names = [str(name) for name in document["sources"]]
+            # The manifest may only name tables in this directory; anything else is malformed.
+            if not self._is_table_name(result_name) or not all(self._is_table_name(name) for name in source_names):
+                raise ValueError("manifest names a non-table path")
+            result = self._manifest_path_to(result_name)
+            sources = [self._manifest_path_to(name) for name in source_names]
+        except (OSError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+            # A torn or malformed manifest is an intent, never sealed data: roll back.
+            phase, result, sources = "writing", None, []
+
+        try:
+            committed = phase == "committed" and result is not None and os.path.exists(result)
+            # The sources are still present; only roll forward once the output itself opens
+            # cleanly. A result that fails its seal is discarded and recovery falls back to the
+            # untouched sources instead of deleting them and then failing.
+            if committed:
+                try:
+                    SSTable.open(result)  # type: ignore[arg-type]
+                except CorruptionError:
+                    committed = False
+            if committed:
+                for old in sources:
+                    if os.path.abspath(old) != os.path.abspath(result) and os.path.exists(old):  # type: ignore[arg-type]
+                        os.unlink(old)
+                fsync_directory(self.directory)
+                durable_replace(self.wal.path)
+                self._unlink_quiet(self._manifest_tmp_path())
+                self._unlink_quiet(manifest_path)
+                fsync_directory(self.directory)
+            else:
+                # Pre-commit rollback (also a committed intent whose result never reached disk or
+                # failed its seal): drop output spools/table and the intent; sources/WAL stay.
+                self._remove_writer_spools(result)
+                self._unlink_quiet(self._manifest_tmp_path())
+                self._unlink_quiet(manifest_path)
+                fsync_directory(self.directory)
+        except OSError as error:
+            raise OutputError("could not finish an interrupted compaction", path=self.directory) from error
+
+    def _remove_writer_spools(self, result: str | None) -> None:
+        """Delete table-writer temp files (and, when asked, a pre-commit output table)."""
+        if result is not None:
+            self._unlink_quiet(result + _TMP_ENTRY)
+            self._unlink_quiet(result + _TMP_FINAL)
+            self._unlink_quiet(result)
+        if not os.path.isdir(self.directory):
+            return
+        for name in os.listdir(self.directory):
+            for suffix in (_TMP_ENTRY, _TMP_FINAL):
+                if name.endswith(suffix) and TABLE_PATTERN.match(name[: -len(suffix)]):
+                    self._unlink_quiet(os.path.join(self.directory, name))
+                    break
+
+    def _remove_wal_spools(self) -> None:
+        if not os.path.isdir(self.directory):
+            return
+        for name in os.listdir(self.directory):
+            if name.startswith(".wal-") and name.endswith(".tmp"):
+                self._unlink_quiet(os.path.join(self.directory, name))
+
+    def _rollback_intent(self, result: str) -> None:
+        """Undo a not-yet-committed compaction intent after a local failure."""
+        try:
+            self._remove_writer_spools(result)
+            self._unlink_quiet(self._manifest_tmp_path())
+            self._unlink_quiet(self._manifest_path())
+            fsync_directory(self.directory)
+        except OSError as error:
+            raise OutputError("could not roll back the failed compaction", path=self.directory) from error
+
+    @staticmethod
+    def _unlink_quiet(path: str) -> None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
     # -- internals -----------------------------------------------------------
     def _table_paths(self) -> list[str]:

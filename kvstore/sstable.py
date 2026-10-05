@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Iterator
 
 from .errors import CorruptionError, ValidationError
+from .wal import fsync_directory
 
 TOMBSTONE = "~"
 TOMBSTONE_BYTE = ord(TOMBSTONE)
@@ -175,6 +176,9 @@ class TableWriter:
             target.flush()
             os.fsync(target.fileno())
         os.replace(self.final_tmp, self.path)
+        # Make the new directory entry durable: without the directory fsync a crash could still
+        # expose the pre-rename state (the spool present, the final table absent).
+        fsync_directory(self.path)
         os.unlink(self.entry_tmp)
         return SSTable.open(self.path)
 

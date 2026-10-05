@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import zlib
 from dataclasses import dataclass
 from typing import Iterable, Iterator
@@ -23,6 +24,50 @@ from .errors import ParseError, ValidationError
 PUT = "put"
 DEL = "del"
 OPS = (PUT, DEL)
+
+
+def fsync_directory(path: str) -> None:
+    """Fsync the directory that owns ``path``'s entries, so renames/unlinks survive a crash.
+
+    A rename or unlink only reaches disk once the *directory* is fsynced; the file fsync alone
+    does not order the directory entry. Failures (e.g. a platform without directory fsync) are
+    tolerated -- the atomic replacement still holds, only the crash guarantee weakens.
+    """
+    try:
+        handle = os.open(os.path.dirname(os.path.abspath(path)) or ".", os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(handle)
+    except OSError:
+        pass
+    finally:
+        os.close(handle)
+
+
+def durable_replace(path: str, data: bytes = b"") -> None:
+    """Atomically replace ``path`` with ``data`` (empty by default) and force it onto disk.
+
+    Temp file write + fsync, atomic rename, directory fsync: on reopen the target is either the
+    old file or the new one, never a torn mix, and the replacement itself survives a power loss.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".wal-", suffix=".tmp", dir=directory)
+    handle = os.fdopen(fd, "wb")
+    try:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+    except BaseException:
+        handle.close()
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp_path, path)
+    fsync_directory(path)
 
 
 def canonical(payload: dict[str, object]) -> str:
@@ -130,12 +175,16 @@ class WriteAheadLog:
         return self._sequence
 
     def reset(self) -> None:
-        """Used by `Store.flush`: the log only ever describes what is not yet sealed."""
+        """Used by `Store.flush`/`Store.compact`: the log only ever describes what is not sealed.
+
+        The truncation is itself a durable atomic replacement, so a crash between sealing a table
+        and reopening the log cannot leave a stale, non-empty log behind that replay would fold
+        back in on top of the sealed data.
+        """
         if self._handle is not None:
             self._handle.close()
             self._handle = None
-        with open(self.path, "w", encoding="utf-8", newline="\n"):
-            pass
+        durable_replace(self.path)
         self._sequence = 0
         self.open()
 
