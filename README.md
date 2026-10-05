@@ -15,8 +15,10 @@ distributed-kv-store describe
 ## 目录布局
 
 ```
-<dir>/wal.log                预写日志（唯一的可变文件）
-<dir>/table-000001.sst       有序表，编号递增；编号越大越新
+<dir>/wal.log                      预写日志（唯一的可变文件，压实提交时会被耐久清空）
+<dir>/table-000001.sst             有序表，编号递增；编号越大越新
+<dir>/compaction-NNNNNN.new[.tmp|.out]  压实中间产物（永不匹配 table 命名，不会被当成有效表）
+<dir>/compact-NNNNNN.manifest[.tmp]    压实提交记录，只存在于提交窗口内
 ```
 
 ## 写路径与崩溃恢复
@@ -33,6 +35,17 @@ distributed-kv-store describe
 ```
 
 `truncatedBytes > 0` 表示**发生过修复**，此时退出码为 **3**（报告已产出但判词为负）。
+
+### 压实的崩溃一致性（清单 + 两阶段提交）
+
+`compact` 合并所有表与内存表，全过程对正常读写语义透明，但落盘分三个耐久阶段，使任意时刻被杀死都可恢复：
+
+1. **写新表（未提交）**：合并结果先流式写入 `compaction-NNNNNN.new`（TableWriter 自身的 `.tmp/.out` 也不匹配 `table-*.sst`），旧表与 WAL 原样不动。此阶段（含新表写完、最终文件出现前后）崩溃 → 下次打开**回滚**：清扫中间产物，旧表 + WAL 即真相，已确认的 put/delete（含较新层墓碑对旧值的遮挡）全部保留。
+2. **发布清单（唯一提交点）**：新表校验封条并 fsync 后，原子 rename + 目录 fsync 写入 `compact-NNNNNN.manifest`（记录 temp/final/旧表清单）。**清单耐久存在 = 压实已提交**，即使立刻杀死进程，下次打开也确定性**前滚**：把新表 rename 到位、逐个删除旧表、清空 WAL、删除清单，每一步幂等可续跑，覆盖任意旧表删除前后、WAL 处理前后终止。
+3. **安装完成**：全部步骤耐久化后才从 `Store.compact` 返回成功；成功返回后立即终止进程，下次打开看到的数据与返回时完全相同。若持久化步骤因文件系统错误无法完成，抛出 `output_error`，且旧的已确认逻辑状态下次打开仍可恢复。
+
+两种物理布局（回滚的旧表+WAL / 前滚的单表）对 `get` 的键值、`scan` 与 `snapshot` 呈现的逻辑数据完全相同；恢复完成后目录不再残留中间产物，`stats`、`verify`、下一张表编号与最终布局一致，后续 `flush` 与再次 `compact` 正常工作。多次关闭、重开收敛到同一布局。旧版本生成、且没有未完成压实的目录可直接打开。
+
 
 ## 读路径与可见性
 
@@ -76,7 +89,7 @@ kvstore/errors.py     异常层次（kind + 上下文）
 kvstore/wal.py        日志编码、崩溃恢复、撕裂尾部截断
 kvstore/memtable.py   内存表与墓碑、字节计数
 kvstore/sstable.py    封存表（header/entry/footer）+ 布隆过滤 + 封条校验；惰性偏移索引、按需读值、流式写表
-kvstore/store.py      读路径、写路径、flush、compact、snapshot、stats、verify
+kvstore/store.py      读路径、写路径、flush、compact（清单两阶段提交 + 崩溃前滚/回滚恢复）、snapshot、stats、verify
 kvstore/cli.py        九个子命令与退出码
-tests/                日志恢复、可见性顺序、压实、快照、CLI 契约、惰性读取/内存常驻/损坏矩阵
+tests/                日志恢复、可见性顺序、压实、快照、CLI 契约、惰性读取/内存常驻/损坏矩阵、压实崩溃矩阵（真实 os._exit 子进程注入）
 ```
