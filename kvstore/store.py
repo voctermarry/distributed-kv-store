@@ -204,7 +204,11 @@ class Store:
     # -- writes --------------------------------------------------------------
     def put(self, key: str, value: str) -> None:
         self._check_key(key)
+        # The counter moves only once the record is durable: append() raises before returning if
+        # the write or fsync fails, so a failed append can never count a record the log cannot
+        # recover. A later sealing failure leaves both the WAL row and this count intact.
         self.wal.append(PUT, key, value)
+        self.wal_records += 1
         self.memtable.put(key, value)
         self.writes += 1
         if self.memtable.is_full():
@@ -213,6 +217,7 @@ class Store:
     def delete(self, key: str) -> None:
         self._check_key(key)
         self.wal.append(DEL, key)
+        self.wal_records += 1
         self.memtable.delete(key)
         self.writes += 1
         if self.memtable.is_full():
