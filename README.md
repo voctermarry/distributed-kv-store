@@ -73,6 +73,34 @@ distributed-kv-store describe
 
 所有子命令都接受 `--memtable-limit <bytes>`（默认 1 MiB，写满自动封表）。
 
+## 一致性哈希路由（`HashRing`，仅供 Python 调用）
+
+`kvstore.HashRing` 是一个**独立、纯内存**的一致性哈希路由器，为后续多节点存储与副本复制确定稳定归属；它不读写任何 Store 目录、不搬移值，也不改变上述任何单机语义。CLI 九个子命令、`describe` 输出、JSON 形状、退出码与磁盘格式均不因它而变化。
+
+```python
+from kvstore import HashRing
+
+ring = HashRing(["node-a", "node-b", "node-c"], virtual_nodes=64, replicas=3)
+ring.nodes_for("any non-empty key")   # -> ['node-b', 'node-a', 'node-c']：主节点在前，副本顺时针
+ring.with_node("node-d")              # 派生加入节点后的新环（原环不变）
+ring.without_node("node-b")           # 派生移除节点后的新环（原环不变）
+ring.rebalance_plan(new_ring, ["k1", "k2", ...])
+```
+
+- **固定映射（UTF-8 + SHA-256，跨平台一致）**：键令牌为 `SHA-256(key.encode("utf-8"))` 的大端整数；虚拟节点 `i`（`0 .. virtual_nodes-1`）的令牌为 `SHA-256(node.encode("utf-8") + b"#" + str(i).encode("ascii"))`。节点标识与键都以 UTF-8 参与哈希，因此同一组节点无论输入顺序、进程（不依赖 `PYTHONHASHSEED`）或平台如何，主节点及副本顺序完全一致。
+- **归属**：键归属于其令牌顺时针方向（含同令牌）遇到的第一个虚拟节点；从该点起沿环行走、跳过已出现节点，并在越过最大令牌后从环首继续，得到**有序且互不相同**的负责节点序列，长度为 `min(replicas, 当前节点数)`。
+- **令牌碰撞**：同一令牌上的虚拟节点不丢失，按 `(节点标识, 虚拟节点序号)` 给出唯一、跨平台稳定的次序。
+- **派生与再平衡计划**：`with_node` / `without_node` 返回新环，原对象保持不变，便于先审查后传输。`rebalance_plan(new_ring, keys)` 对调用方给出的键集合（重复键合并、按键的 Unicode 码点序输出、每键至多一条）比较新旧环；只对**负责节点序列（含顺序）发生变化**的键生成条目：
+
+  ```json
+  {"key": "k", "oldNodes": ["b", "a"], "newNodes": ["d", "b"],
+   "addedNodes": ["d"], "revokedNodes": ["a"]}
+  ```
+
+  - 加入节点：只有落入新节点虚拟位置所接管（前一虚拟位置，本虚拟位置]半开区间（含跨环首回绕）的键才会更换主节点；
+  - 移除节点：原由该节点负责的键顺时针转移到仍存活的不同节点，其他键主节点不漂移；副本序列一律按新环重新确定。
+- **校验**（统一抛 `validation_error`，错误上下文带对应字段）：空键（`key`）、空节点标识、重复节点、非正整数 `virtual_nodes`/`replicas`（构造时）；加入已存在节点、移除不存在节点、加入/移除空标识（带 `node`）；移除最后一个节点必定失败，因此不会产生不可查询的环。规划输入中的空键与查询同一规则报错。
+
 ## 保障
 
 - 键不得为空、不得含制表符或换行（否则报 `validation_error`）。
@@ -90,6 +118,7 @@ kvstore/wal.py        日志编码、崩溃恢复、撕裂尾部截断
 kvstore/memtable.py   内存表与墓碑、字节计数
 kvstore/sstable.py    封存表（header/entry/footer）+ 布隆过滤 + 封条校验；惰性偏移索引、按需读值、流式写表
 kvstore/store.py      读路径、写路径、flush、compact（清单两阶段提交 + 崩溃前滚/回滚恢复）、snapshot、stats、verify
+kvstore/hash_ring.py  独立一致性哈希路由（SHA-256 虚拟节点、有序副本、加入/移除派生、确定性再平衡计划）
 kvstore/cli.py        九个子命令与退出码
-tests/                日志恢复、可见性顺序、压实、快照、CLI 契约、惰性读取/内存常驻/损坏矩阵、压实崩溃矩阵（真实 os._exit 子进程注入）
+tests/                日志恢复、可见性顺序、压实、快照、CLI 契约、惰性读取/内存常驻/损坏矩阵、压实崩溃矩阵（真实 os._exit 子进程注入）、一致性哈希路由与再平衡计划
 ```

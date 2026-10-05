@@ -1,14 +1,17 @@
 """A small LSM key/value store: write-ahead log, sorted tables, snapshots.
 
 The public surface is deliberately narrow: `Store` for reads and writes, `Snapshot` for consistent
-reads, and one exception hierarchy whose `kind` is stable so callers never match on message text.
+reads, `HashRing` for standalone consistent-hash routing, and one exception hierarchy whose
+`kind` is stable so callers never match on message text.
 """
 
 from .errors import CorruptionError, KVError, OutputError, ParseError, ValidationError
+from .hash_ring import HashRing
 from .store import Snapshot, Store, StoreStats
 
 __all__ = [
     "CorruptionError",
+    "HashRing",
     "KVError",
     "OutputError",
     "ParseError",
