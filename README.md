@@ -1,6 +1,6 @@
 # distributed-kv-store
 
-单机 LSM 键值存储（Python 标准库实现，无第三方依赖）：预写日志、有序表、布隆过滤、快照与压实。
+单机 LSM 键值存储（Python 标准库实现，无第三方依赖）：预写日志、有序表、布隆过滤、快照与压实。另提供一个**独立、纯内存**的一致性哈希路由层 `HashRing`，不读写 Store 目录、不影响任何磁盘语义。
 
 ## 安装与入口
 
@@ -73,6 +73,31 @@ distributed-kv-store describe
 
 所有子命令都接受 `--memtable-limit <bytes>`（默认 1 MiB，写满自动封表）。
 
+## 一致性哈希路由（仅 Python 调用）
+
+`kvstore.HashRing` 是与 Store 完全独立的路由功能：构造、查询、派生、规划都不触碰磁盘，`describe` 与九个 CLI 子命令的行为、JSON、退出码和磁盘格式均不因它改变。
+
+```python
+from kvstore import HashRing
+
+ring = HashRing(["node-a", "node-b", "node-c"], virtual_nodes=128, replicas=3)
+ring.nodes_for("user:1001")          # ['主节点', '副本1', '副本2']：不同节点、主在前
+ring.primary_node("user:1001")       # 主节点
+
+grown = ring.with_node("node-d")     # 派生新环；ring 本身不变
+shrunk = grown.without_node("node-a")
+plan = ring.plan_rebalance(keys, grown, joined=["node-d"])  # 先审查、再搬数据
+```
+
+契约：
+
+- **固定映射**：节点标识与键都按 UTF-8 字节进入 SHA-256；虚拟节点令牌为 `sha256("<node>#<index>")`（`index` 从 0 起）。同一组节点无论输入顺序、进程、平台，主节点与副本顺序都一致。
+- **有序负责节点**：从键令牌处顺时针遇到的第一个虚拟位置的节点为主，继续顺时针收集**不同**节点，越过环尾则从环首继续；返回长度为 `min(replicas, 节点数)`。
+- **令牌碰撞**：碰撞按 `(节点标识, 虚拟节点序号)` 稳定排序，虚拟节点不丢失、次序跨平台一致。
+- **派生**：`with_node` / `without_node` 返回新环，原环不变。加入已存在节点、移除不存在节点、移除最后一个节点均报 `validation_error`，异常上下文带 `node`。
+- **再平衡计划**：`plan_rebalance(keys, new_ring, joined=..., left=...)` 对键去重并按 Unicode 码位排序，每个键至多出现一次；负责序列（成员及顺序）完全未变的键不进入计划。每个 `KeyMigration` 记录 `key`、`oldNodes`、`newNodes`、`addNodes`、`removeNodes`。加入节点时只有新节点虚拟位置接管区间内的键会换主；移除节点后，原由它负责的键顺时针转给仍存活的不同节点，其他键的主节点不漂移，副本序列一律按新环重新确定。
+- **校验**：空节点集合/空标识/重复节点、非正整数 `virtual_nodes` 或 `replicas`、空键（查询与规划同规则）统一抛 `validation_error`；规划中的重复键合并。规划全程不读写 Store 目录、不搬移任何值。
+
 ## 保障
 
 - 键不得为空、不得含制表符或换行（否则报 `validation_error`）。
@@ -90,6 +115,7 @@ kvstore/wal.py        日志编码、崩溃恢复、撕裂尾部截断
 kvstore/memtable.py   内存表与墓碑、字节计数
 kvstore/sstable.py    封存表（header/entry/footer）+ 布隆过滤 + 封条校验；惰性偏移索引、按需读值、流式写表
 kvstore/store.py      读路径、写路径、flush、compact（清单两阶段提交 + 崩溃前滚/回滚恢复）、snapshot、stats、verify
+kvstore/routing.py    一致性哈希路由（HashRing）：固定 SHA-256 虚拟节点环、有序负责节点、加/减节点派生、确定性再平衡计划；纯内存，不触碰 Store
 kvstore/cli.py        九个子命令与退出码
-tests/                日志恢复、可见性顺序、压实、快照、CLI 契约、惰性读取/内存常驻/损坏矩阵、压实崩溃矩阵（真实 os._exit 子进程注入）
+tests/                日志恢复、可见性顺序、压实、快照、CLI 契约、惰性读取/内存常驻/损坏矩阵、压实崩溃矩阵（真实 os._exit 子进程注入）、一致性哈希路由与再平衡计划
 ```
